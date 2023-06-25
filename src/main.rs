@@ -1,3 +1,5 @@
+// FIXME: fix all let _
+
 use std::{
     cmp::Ordering,
     collections::BTreeSet,
@@ -6,6 +8,7 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     thread,
     time::Duration,
 };
@@ -14,6 +17,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use log::warn;
 use regex::Regex;
+use serde::Serialize;
 use toml::{Table, Value};
 use walkdir::{DirEntry, WalkDir};
 
@@ -34,15 +38,20 @@ fn main() -> Result<()> {
     env_logger::init();
     let args = Cli::parse();
 
-    let projs = Projects::<PathBuf>::new(&args.directory, &args)?;
-    projs.list();
+    let projs = Projects::new(&args.directory, &args)?;
+    if args.list {
+        projs.list(&args)
+    } else {
+        projs.clean(&args);
+    }
     Ok(())
 }
 
 /// A project is uniquely identified by the path to its Cargo.toml. Note that
 /// the path stored in self.0 includes the `Cargo.toml` at the end.
-pub struct Project<P: AsRef<Path>> {
-    path: P,
+#[derive(Serialize)]
+pub struct Project {
+    path: PathBuf,
     name: Name,
     size: Option<u64>,
 }
@@ -50,7 +59,7 @@ pub struct Project<P: AsRef<Path>> {
 /// Name of a project. `Explicit` corresponds to a name in the package.name field
 /// of a Cargo.toml, which the `Inferred` name is the name of the parent directory
 /// of the Cargo.toml. This is used when no package.name field exists
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Serialize)]
 enum Name {
     Explicit(String),
     Inferred(String),
@@ -65,11 +74,8 @@ impl Display for Name {
     }
 }
 
-impl<P> Project<P>
-where
-    P: AsRef<Path>,
-{
-    pub fn new(path: P) -> Result<Self> {
+impl Project {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         // Make sure it's a valid Cargo.toml
         match path.as_ref().file_name() {
             Some(name) => {
@@ -110,58 +116,54 @@ where
 
         // Get the size
         let mut initial = Project {
-            path,
+            path: path.as_ref().to_owned(),
             name,
             size: None,
         };
-        initial.size = Some(initial.dirsize()?);
+        initial.size = initial.dirsize()?;
 
         return Ok(initial);
     }
 
-    pub fn dirsize(&self) -> Result<u64> {
+    pub fn dirsize(&self) -> Result<Option<u64>> {
         // Get path to target/ dir
-        let mut target = self.path.as_ref().parent().unwrap().to_owned();
+        let mut target = self.path.parent().unwrap().to_owned();
         target.push("target/");
 
         match target.try_exists() {
             Ok(true) => (),
-            Ok(false) => return Ok(0),
+            Ok(false) => return Ok(None),
             Err(e) => {
                 return Result::Err(anyhow::Error::from(e))
                     .context("failed to access target directory")
             }
         }
 
-        Ok(WalkDir::new(target)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .fold(0, |acc, item| acc + item.metadata().unwrap().len()))
+        Ok(Some(
+            WalkDir::new(target)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .fold(0, |acc, item| acc + item.metadata().unwrap().len()),
+        ))
     }
 }
 
-impl<P> Debug for Project<P>
-where
-    P: AsRef<Path>,
-{
+impl Debug for Project {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Project")
-            .field("path", &self.path.as_ref())
+            .field("path", &self.path)
             .field("name", &self.name as &dyn Debug)
             .field("size", &self.size as &dyn Debug)
             .finish()
     }
 }
 
-impl<P> PartialOrd for Project<P>
-where
-    P: AsRef<Path>,
-{
+impl PartialOrd for Project {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match Some(self.size.cmp(&other.size)) {
             Some(ord) => match ord {
                 Ordering::Less => Some(ord),
-                Ordering::Equal => Some(self.path.as_ref().cmp(other.path.as_ref())),
+                Ordering::Equal => Some(self.path.cmp(&other.path)),
                 Ordering::Greater => Some(ord),
             },
             None => None,
@@ -169,10 +171,7 @@ where
     }
 }
 
-impl<P> Ord for Project<P>
-where
-    P: AsRef<Path>,
-{
+impl Ord for Project {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match self.partial_cmp(other) {
             Some(order) => order,
@@ -181,29 +180,25 @@ where
     }
 }
 
-impl<P> PartialEq for Project<P>
-where
-    P: AsRef<Path>,
-{
+impl PartialEq for Project {
     fn eq(&self, other: &Self) -> bool {
-        self.path.as_ref() == other.path.as_ref()
+        self.path == other.path
     }
 }
 
-impl<P> Eq for Project<P> where P: AsRef<Path> {}
+impl Eq for Project {}
 
-#[derive(Debug)]
-struct Projects<P: AsRef<Path>> {
-    included: BTreeSet<Project<P>>,
-    ignored: BTreeSet<Project<P>>,
+#[derive(Debug, Serialize)]
+struct Projects {
+    included: BTreeSet<Project>,
+    ignored: BTreeSet<Project>,
 }
 
-impl<P> Projects<P>
-where
-    P: AsRef<Path>,
-{
+impl Projects {
     // TODO: make this just take the config?
-    pub fn new(path: impl AsRef<Path>, config: &Cli) -> Result<Projects<PathBuf>> {
+    pub fn new(path: impl AsRef<Path>, config: &Cli) -> Result<Projects> {
+        let mut out = io::stdout();
+
         // TODO: do the bar
         let re = if let Some(re) = &config.exclude {
             Regex::new(&re).unwrap()
@@ -230,9 +225,11 @@ where
             let project = Project::new(entry.path().to_owned()).unwrap();
 
             if atty::is(atty::Stream::Stdout) {
+                // Erase before so that project remains displayed until next
+                // one is ready
                 println!(
                     "{ERASE}{} <- {}",
-                    to_memory_string(project.size.unwrap_or(0)),
+                    to_memory_string(project.size),
                     project.path.parent().unwrap().to_str().unwrap()
                 );
             }
@@ -245,6 +242,13 @@ where
 
             wait(15);
         }
+
+        // Final erase for last item
+        if atty::is(atty::Stream::Stdout) {
+            let _ = write!(out, "{ERASE}");
+            let _ = out.flush();
+        }
+
         if config.invert {
             Ok(Projects {
                 included: matches,
@@ -258,43 +262,45 @@ where
         }
     }
 
-    pub fn list(&self) {
-        let mut stdout = io::stdout().lock();
-        let (count, sum) = self
-            .included
-            .iter()
-            .inspect(|project| {
-                wait(15);
-                let _ = write!(
-                    stdout,
-                    "{} <- {}\n",
-                    to_memory_string(project.size.unwrap_or(0)),
-                    project.path.as_ref().parent().unwrap().to_str().unwrap()
-                );
-            })
-            .map(|project| project.size)
-            .fold((0, 0), |(count, sum), size| {
-                (count + 1, sum + size.unwrap_or(0))
-            });
-        println!("Summary: {count} projects, {}", to_memory_string(sum));
+    pub fn list(&self, config: &Cli) {
+        if config.json {
+            println!("{}", serde_json::to_string_pretty(&self).unwrap())
+        }
+        self.included.list();
         println!("Ignored:");
-        let (count, sum) = self
-            .ignored
-            .iter()
-            .inspect(|project| {
-                wait(15);
-                let _ = write!(
-                    stdout,
-                    "{} <- {}\n",
-                    to_memory_string(project.size.unwrap_or(0)),
-                    project.path.as_ref().parent().unwrap().to_str().unwrap()
-                );
-            })
-            .map(|project| project.size)
-            .fold((0, 0), |(count, sum), size| {
-                (count + 1, sum + size.unwrap_or(0))
-            });
-        println!("Summary: {count} projects, {}", to_memory_string(sum));
+        self.ignored.list();
+    }
+
+    pub fn clean(&self, config: &Cli) {
+        self.included.list();
+        if !config.yes {
+            println!("Confirm you want to clean these projects [y/n]:");
+            let mut buf = String::new();
+            loop {
+                print(&format!("{GREEN}> {RESET}"));
+                buf.clear();
+                while let Err(e) = io::stdin().read_line(&mut buf) {
+                    warn!("Error reading from stdin: {e}")
+                }
+                if ["n", "no"]
+                    .iter()
+                    .any(|response| response == &&*buf.trim().to_lowercase())
+                {
+                    println!("Aborting.");
+                    return;
+                } else if ["y", "yes"]
+                    .iter()
+                    .any(|response| response == &&*buf.trim().to_lowercase())
+                {
+                    break;
+                } else {
+                    println!("Unknown response. Please try again.")
+                }
+            }
+        }
+        self.included.clean();
+        println!("Ignored:");
+        self.ignored.list();
     }
 }
 
@@ -304,22 +310,26 @@ macro_rules! color {
     };
 }
 
-fn to_memory_string(bytes: u64) -> String {
-    match bytes {
-        1_000_000_000.. => {
-            color!(RED, "{:3} GB", bytes / 1_000_000_000)
+fn to_memory_string(bytes: Option<u64>) -> String {
+    if let Some(bytes) = bytes {
+        match bytes {
+            1_000_000_000.. => {
+                color!(RED, "{:3} GB", bytes / 1_000_000_000)
+            }
+            1_000_000.. => {
+                color!(BLUE, "{:3} MB", bytes / 1_000_000)
+            }
+            1_000.. => {
+                color!(GREEN, "{:3} KB", bytes / 1_000)
+            }
+            _ => {
+                // One extra space between the letters and B because the other units
+                // have G/M/B
+                format!("{bytes:3}  B")
+            }
         }
-        1_000_000.. => {
-            color!(BLUE, "{:3} MB", bytes / 1_000_000)
-        }
-        1_000.. => {
-            color!(GREEN, "{:3} KB", bytes / 1_000)
-        }
-        _ => {
-            // One extra space between the letters and B because the other units
-            // have G/M/B
-            format!("{bytes:3}  B")
-        }
+    } else {
+        color!(YELLOW, "N/A --")
     }
 }
 
@@ -330,16 +340,20 @@ fn is_hidden(entry: &DirEntry) -> bool {
         .map(|s| s.starts_with("."))
         .unwrap_or(false)
 }
+
 fn wait(millis: u64) {
     thread::sleep(Duration::from_millis(millis));
+}
+
+fn print(contents: &str) {
+    let mut out = io::stdout();
+    let _ = out.write_all(contents.as_bytes());
+    let _ = out.flush();
 }
 
 #[derive(Parser, Debug)]
 #[command(about = "Manage rustc build artifacts")]
 struct Cli {
-    #[command(subcommand)]
-    action: Option<Action>,
-
     #[arg(short, long)]
     #[arg(default_value_t = String::from(env!("HOME")))]
     directory: String,
@@ -358,27 +372,60 @@ struct Cli {
 
     #[arg(short, long)]
     yes: bool,
+
+    #[arg(short, long, requires = "list")]
+    json: bool,
 }
 
-#[derive(Parser, Debug, Clone)]
-enum Action {
-    Profile,
+fn erase() -> Result<()> {
+    let mut out = io::stdout();
+    out.write_all(ERASE.as_bytes())?;
+    out.flush()?;
+    Ok(())
 }
 
 trait Vanish {
-    fn list(&self, config: Cli);
-    fn clean(&self, config: Cli);
+    fn list(&self);
+    fn clean(&self);
 }
 
-impl<P> Vanish for BTreeSet<Project<P>>
-where
-    P: AsRef<Path>,
-{
-    fn list(&self, config: Cli) {
-        todo!()
+impl Vanish for BTreeSet<Project> {
+    fn list(&self) {
+        let size = self.len();
+        let total: u64 = self.iter().map(|p| p.size.unwrap_or(0)).sum();
+        for project in self {
+            let mut stdout = io::stdout().lock();
+            wait(15);
+            let _ = write!(
+                stdout,
+                "{} <- {}\n",
+                to_memory_string(project.size),
+                project.path.parent().unwrap().to_str().unwrap()
+            );
+        }
+        println!(
+            "Summary: {size} projects, {}",
+            to_memory_string(Some(total))
+        )
     }
 
-    fn clean(&self, config: Cli) {
-        todo!()
+    fn clean(&self) {
+        for project in self {
+            wait(15);
+            println!("Cleaning: {:?}", project.path);
+            match Command::new("cargo")
+                .arg("clean")
+                .arg("--manifest-path")
+                .arg(&project.path)
+                .stdout(Stdio::inherit())
+                .status()
+            {
+                Ok(_) => (),
+                Err(e) => warn!("Error cleaning {:?}: {e}", project.path),
+            }
+            if let Err(e) = erase() {
+                warn!("Error clearning screen: {e}")
+            }
+        }
     }
 }
