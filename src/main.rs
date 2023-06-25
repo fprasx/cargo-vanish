@@ -89,12 +89,9 @@ where
 
         let name = toml
             .get("package")
-            .map(Value::as_table)
-            .flatten()
-            .map(|pack| pack.get("name"))
-            .flatten()
-            .map(Value::as_str)
-            .flatten()
+            .and_then(Value::as_table)
+            .and_then(|pack| pack.get("name"))
+            .and_then(Value::as_str)
             .map(|name| Name::Explicit(name.to_string()))
             .unwrap_or(Name::Inferred(
                 path.as_ref()
