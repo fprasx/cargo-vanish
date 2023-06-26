@@ -34,6 +34,22 @@ pub const WHITE: &str = "\x1B[0;37m"; // White
 /// Move cusor up a line, erase it, and go to beginning
 pub const ERASE: &str = "\x1b[1A\x1b[2K";
 
+macro_rules! color {
+    ($color:ident, $($args:expr),* $(,)?) => {
+        format!("{}{}{RESET}", $color, format!($($args),*))
+    };
+}
+
+macro_rules! output {
+    ($stream:ident, $($args:expr),* $(,)?) => {
+        write!($stream, "{PURPLE}=> {RESET}{}", format!($($args),*))
+    };
+
+    ($($args:expr),* $(,)?) => {
+        println!("{PURPLE}=> {RESET}{}", format!($($args),*))
+    };
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let args = Cli::parse();
@@ -76,22 +92,23 @@ impl Display for Name {
 
 impl Project {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         // Make sure it's a valid Cargo.toml
-        match path.as_ref().file_name() {
+        match path.file_name() {
             Some(name) => {
                 if name.to_str() != Some("Cargo.toml") {
-                    bail!("{:?} is not a Cargo.toml file", path.as_ref())
+                    bail!("{:?} is not a Cargo.toml file", path)
                 }
             }
-            None => bail!("{:?} is not a Cargo.toml file", path.as_ref()),
+            None => bail!("{:?} is not a Cargo.toml file", path),
         }
 
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {:?}", &path.as_ref()))?;
+        let contents =
+            fs::read_to_string(&path).with_context(|| format!("Failed to read {:?}", &path))?;
 
         let toml = contents
             .parse::<Table>()
-            .with_context(|| format!("Failed to parse {:?}", path.as_ref()))?;
+            .with_context(|| format!("Failed to parse {:?}", path))?;
 
         let name = toml
             .get("package")
@@ -100,23 +117,19 @@ impl Project {
             .and_then(Value::as_str)
             .map(|name| Name::Explicit(name.to_string()))
             .unwrap_or(Name::Inferred(
-                path.as_ref()
-                    .parent()
+                path.parent()
                     .ok_or(anyhow!(
                         "Failed to find name field or parent directory for {:?}",
-                        path.as_ref()
+                        path
                     ))?
                     .to_str()
-                    .ok_or(anyhow!(
-                        "Failed to convert path {:?} to string",
-                        path.as_ref()
-                    ))?
+                    .ok_or(anyhow!("Failed to convert path {:?} to string", path))?
                     .to_string(),
             ));
 
         // Get the size
         let mut initial = Project {
-            path: path.as_ref().to_owned(),
+            path: path.to_owned(),
             name,
             size: None,
         };
@@ -145,6 +158,10 @@ impl Project {
                 .filter_map(|e| e.ok())
                 .fold(0, |acc, item| acc + item.metadata().unwrap().len()),
         ))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -197,8 +214,6 @@ struct Projects {
 impl Projects {
     // TODO: make this just take the config?
     pub fn new(path: impl AsRef<Path>, config: &Cli) -> Result<Projects> {
-        let mut out = io::stdout();
-
         // TODO: do the bar
         let re = if let Some(re) = &config.exclude {
             Regex::new(&re).unwrap()
@@ -209,6 +224,11 @@ impl Projects {
 
         let mut matches = BTreeSet::new();
         let mut unmatched = BTreeSet::new();
+
+        if atty::is(atty::Stream::Stdout) && !config.json {
+            // Extra newline gets eaten by first erase
+            output!("Searching for projects:\n");
+        }
 
         for entry in WalkDir::new(path)
             .into_iter()
@@ -224,11 +244,12 @@ impl Projects {
         {
             let project = Project::new(entry.path().to_owned()).unwrap();
 
-            if atty::is(atty::Stream::Stdout) {
+            if atty::is(atty::Stream::Stdout) && !config.json {
                 // Erase before so that project remains displayed until next
                 // one is ready
-                println!(
-                    "{ERASE}{} <- {}",
+                print(ERASE);
+                output!(
+                    "{} {}",
                     to_memory_string(project.size),
                     project.path.parent().unwrap().to_str().unwrap()
                 );
@@ -243,10 +264,11 @@ impl Projects {
             wait(15);
         }
 
-        // Final erase for last item
-        if atty::is(atty::Stream::Stdout) {
-            let _ = write!(out, "{ERASE}");
-            let _ = out.flush();
+        if atty::is(atty::Stream::Stdout) && !config.json {
+            // Final erase for last item
+            print(ERASE);
+            // Erase "searching for projects"
+            print(ERASE);
         }
 
         if config.invert {
@@ -264,17 +286,22 @@ impl Projects {
 
     pub fn list(&self, config: &Cli) {
         if config.json {
-            println!("{}", serde_json::to_string_pretty(&self).unwrap())
+            println!("{}", serde_json::to_string_pretty(&self).unwrap());
+            return;
         }
-        self.included.list();
-        println!("Ignored:");
-        self.ignored.list();
+        if !self.included.is_empty() {
+            self.included.list();
+        }
+        if !self.ignored.is_empty() {
+            output!("Ignored:");
+            self.ignored.list();
+        }
     }
 
     pub fn clean(&self, config: &Cli) {
         self.included.list();
         if !config.yes {
-            println!("Confirm you want to clean these projects [y/n]:");
+            output!("Are you sure you would like to clean these projects [y/n]:");
             let mut buf = String::new();
             loop {
                 print(&format!("{GREEN}> {RESET}"));
@@ -286,7 +313,7 @@ impl Projects {
                     .iter()
                     .any(|response| response == &&*buf.trim().to_lowercase())
                 {
-                    println!("Aborting.");
+                    output!("Aborting.");
                     return;
                 } else if ["y", "yes"]
                     .iter()
@@ -294,20 +321,16 @@ impl Projects {
                 {
                     break;
                 } else {
-                    println!("Unknown response. Please try again.")
+                    output!("Unknown response. Please try again.")
                 }
             }
         }
         self.included.clean();
-        println!("Ignored:");
-        self.ignored.list();
+        if config.ignored {
+            output!("Ignored:");
+            self.ignored.list();
+        }
     }
-}
-
-macro_rules! color {
-    ($color:ident, $($args:expr),* $(,)?) => {
-        format!("{}{}{RESET}", $color, format!($($args),*))
-    };
 }
 
 fn to_memory_string(bytes: Option<u64>) -> String {
@@ -345,6 +368,7 @@ fn wait(millis: u64) {
     thread::sleep(Duration::from_millis(millis));
 }
 
+/// Print and flush stdout (avoids line-buffering issue)
 fn print(contents: &str) {
     let mut out = io::stdout();
     let _ = out.write_all(contents.as_bytes());
@@ -375,6 +399,9 @@ struct Cli {
 
     #[arg(short, long, requires = "list")]
     json: bool,
+
+    #[arg(short, long)]
+    ignored: bool,
 }
 
 fn erase() -> Result<()> {
@@ -396,23 +423,23 @@ impl Vanish for BTreeSet<Project> {
         for project in self {
             let mut stdout = io::stdout().lock();
             wait(15);
-            let _ = write!(
+            let _ = output!(
                 stdout,
-                "{} <- {}\n",
+                "{} {}\n",
                 to_memory_string(project.size),
                 project.path.parent().unwrap().to_str().unwrap()
             );
         }
-        println!(
+        output!(
             "Summary: {size} projects, {}",
-            to_memory_string(Some(total))
+            to_memory_string(Some(total)).trim()
         )
     }
 
     fn clean(&self) {
         for project in self {
             wait(15);
-            println!("Cleaning: {:?}", project.path);
+            output!("Cleaning: {:?}", project.path);
             match Command::new("cargo")
                 .arg("clean")
                 .arg("--manifest-path")
